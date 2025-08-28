@@ -1,6 +1,16 @@
 twitch-videoad.js text/javascript
 (function() {
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
+    var ourTwitchAdSolutionsVersion = 8;// Used to prevent conflicts with outdated versions of the scripts
+    if (typeof unsafeWindow === 'undefined') {
+        unsafeWindow = window;
+    }
+    if (typeof unsafeWindow.twitchAdSolutionsVersion !== 'undefined' && unsafeWindow.twitchAdSolutionsVersion >= ourTwitchAdSolutionsVersion) {
+        console.log("skipping video-swap-new as there's another script active. ourVersion:" + ourTwitchAdSolutionsVersion + " activeVersion:" + unsafeWindow.twitchAdSolutionsVersion);
+        unsafeWindow.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
+        return;
+    }
+    unsafeWindow.twitchAdSolutionsVersion = ourTwitchAdSolutionsVersion;
     function declareOptions(scope) {
         // Options / globals
         scope.OPT_MODE_STRIP_AD_SEGMENTS = true;
@@ -24,9 +34,66 @@ twitch-videoad.js text/javascript
         scope.AuthorizationHeader = null;
     }
     var twitchWorkers = [];
-    const oldWorker = window.Worker;
+    var workerStringConflicts = [
+        'twitch',
+        'isVariantA'// TwitchNoSub
+    ];
+    var workerStringAllow = [];
+    var workerStringReinsert = [
+        'isVariantA',// TwitchNoSub (prior to (0.9))
+        'besuper/',// TwitchNoSub (0.9)
+        '${patch_url}'// TwitchNoSub (0.9.1)
+    ];
+    function getCleanWorker(worker) {
+        var root = null;
+        var parent = null;
+        var proto = worker;
+        while (proto) {
+            var workerString = proto.toString();
+            if (workerStringConflicts.some((x) => workerString.includes(x)) && !workerStringAllow.some((x) => workerString.includes(x))) {
+                if (parent !== null) {
+                    Object.setPrototypeOf(parent, Object.getPrototypeOf(proto));
+                }
+            } else {
+                if (root === null) {
+                    root = proto;
+                }
+                parent = proto;
+            }
+            proto = Object.getPrototypeOf(proto);
+        }
+        return root;
+    }
+    function getWorkersForReinsert(worker) {
+        var result = [];
+        var proto = worker;
+        while (proto) {
+            var workerString = proto.toString();
+            if (workerStringReinsert.some((x) => workerString.includes(x))) {
+                result.push(proto);
+            } else {
+            }
+            proto = Object.getPrototypeOf(proto);
+        }
+        return result;
+    }
+    function reinsertWorkers(worker, reinsert) {
+        var parent = worker;
+        for (var i = 0; i < reinsert.length; i++) {
+            Object.setPrototypeOf(reinsert[i], parent);
+            parent = reinsert[i];
+        }
+        return parent;
+    }
+    function isValidWorker(worker) {
+        var workerString = worker.toString();
+        return !workerStringConflicts.some((x) => workerString.includes(x))
+            || workerStringAllow.some((x) => workerString.includes(x))
+            || workerStringReinsert.some((x) => workerString.includes(x));
+    }
     function hookWindowWorker() {
-        window.Worker = class Worker extends oldWorker {
+        var reinsert = getWorkersForReinsert(unsafeWindow.Worker);
+        var newWorker = class Worker extends getCleanWorker(unsafeWindow.Worker) {
             constructor(twitchBlobUrl, options) {
                 var isTwitchWorker = false;
                 try {
@@ -37,6 +104,7 @@ twitch-videoad.js text/javascript
                     return;
                 }
                 var newBlobStr = `
+                    const pendingFetchRequests = new Map();
                     ${processM3U8.toString()}
                     ${hookWorkerFetch.toString()}
                     ${declareOptions.toString()}
@@ -46,26 +114,41 @@ twitch-videoad.js text/javascript
                     ${tryNotifyAdsWatchedM3U8.toString()}
                     ${parseAttributes.toString()}
                     ${onFoundAd.toString()}
-                    ${getWasmWorkerUrl.toString()}
-                    var workerUrl = getWasmWorkerUrl('${twitchBlobUrl.replaceAll("'", "%27")}');
-                    if (workerUrl && workerUrl.includes('assets.twitch.tv/assets/amazon-ivs-wasmworker')) {
-                        declareOptions(self);
-                        self.addEventListener('message', function(e) {
-                            if (e.data.key == 'UboUpdateDeviceId') {
-                                gql_device_id = e.data.value;
-                            } else if (e.data.key == 'UpdateClientIntegrityHeader') {
-                                ClientIntegrityHeader = e.data.value;
-                            } else if (e.data.key == 'UpdateAuthorizationHeader') {
-                                AuthorizationHeader = e.data.value;
+                    ${getWasmWorkerJs.toString()}
+                    var workerString = getWasmWorkerJs('${twitchBlobUrl.replaceAll("'", "%27")}');
+                    declareOptions(self);
+                    self.addEventListener('message', function(e) {
+                        if (e.data.key == 'UboUpdateDeviceId') {
+                            gql_device_id = e.data.value;
+                        } else if (e.data.key == 'UpdateClientIntegrityHeader') {
+                            ClientIntegrityHeader = e.data.value;
+                        } else if (e.data.key == 'UpdateAuthorizationHeader') {
+                            AuthorizationHeader = e.data.value;
+                        } else if (e.data.key == 'FetchResponse') {
+                            const responseData = e.data.value;
+                            if (pendingFetchRequests.has(responseData.id)) {
+                                const { resolve, reject } = pendingFetchRequests.get(responseData.id);
+                                pendingFetchRequests.delete(responseData.id);
+                                if (responseData.error) {
+                                    reject(new Error(responseData.error));
+                                } else {
+                                    // Create a Response object from the response data
+                                    const response = new Response(responseData.body, {
+                                        status: responseData.status,
+                                        statusText: responseData.statusText,
+                                        headers: responseData.headers
+                                    });
+                                    resolve(response);
+                                }
                             }
-                        });
-                        hookWorkerFetch();
-                        importScripts(workerUrl);
-                    }
+                        }
+                    });
+                    hookWorkerFetch();
+                    eval(workerString);
                 `
                 super(URL.createObjectURL(new Blob([newBlobStr])), options);
                 twitchWorkers.push(this);
-                this.onmessage = function(e) {
+                this.addEventListener('message', (e) => {
                     // NOTE: Removed adDiv caching as '.video-player' can change between streams?
                     if (e.data.key == 'UboShowAdBanner') {
                         var adDiv = getAdDiv();
@@ -89,7 +172,17 @@ twitch-videoad.js text/javascript
                     } else if (e.data.key == 'UboSeekPlayer') {
                         reloadTwitchPlayer(true);
                     }
-                }
+                });
+                this.addEventListener('message', async event => {
+                    if (event.data.key == 'FetchRequest') {
+                        const fetchRequest = event.data.value;
+                        const responseData = await handleWorkerFetchRequest(fetchRequest);
+                        this.postMessage({
+                            key: 'FetchResponse',
+                            value: responseData
+                        });
+                    }
+                });
                 function getAdDiv() {
                     var playerRootDiv = document.querySelector('.video-player');
                     var adDiv = null;
@@ -108,13 +201,26 @@ twitch-videoad.js text/javascript
                 }
             }
         }
+        var workerInstance = reinsertWorkers(newWorker, reinsert);
+        Object.defineProperty(unsafeWindow, 'Worker', {
+            get: function() {
+                return workerInstance;
+            },
+            set: function(value) {
+                if (isValidWorker(value)) {
+                    workerInstance = value;
+                } else {
+                    console.log('Attempt to set twitch worker denied');
+                }
+            }
+        });
     }
-    function getWasmWorkerUrl(twitchBlobUrl) {
+    function getWasmWorkerJs(twitchBlobUrl) {
         var req = new XMLHttpRequest();
         req.open('GET', twitchBlobUrl, false);
         req.overrideMimeType("text/javascript");
         req.send();
-        return req.responseText.split("'")[1];
+        return req.responseText;
     }
     function onFoundAd(streamInfo, textStr, reloadPlayer) {
         console.log('Found ads, switch to backup');
@@ -186,7 +292,7 @@ twitch-videoad.js text/javascript
         return textStr;
     }
     function hookWorkerFetch() {
-        console.log('hookWorkerFetch');
+        console.log('hookWorkerFetch (video-swap-new)');
         var realFetch = fetch;
         fetch = async function(url, options) {
             if (typeof url === 'string') {
@@ -242,7 +348,7 @@ twitch-videoad.js text/javascript
                                 for (var i = 0; i < 2; i++) {
                                     var encodingsUrl = url;
                                     if (i == 1) {
-                                        var accessTokenResponse = await getAccessToken(channelName, OPT_BACKUP_PLAYER_TYPE, OPT_BACKUP_PLATFORM, realFetch);
+                                        var accessTokenResponse = await getAccessToken(channelName, OPT_BACKUP_PLAYER_TYPE, OPT_BACKUP_PLATFORM);
                                         if (accessTokenResponse != null && accessTokenResponse.status === 200) {
                                             var accessToken = await accessTokenResponse.json();
                                             var urlInfo = new URL('https://usher.ttvnw.net/api/channel/hls/' + channelName + '.m3u8' + (new URL(url)).search);
@@ -341,7 +447,7 @@ twitch-videoad.js text/javascript
             },
         }];
     }
-    function getAccessToken(channelName, playerType, platform, realFetch) {
+    function getAccessToken(channelName, playerType, platform) {
         if (!platform) {
             platform = 'web';
         }
@@ -358,23 +464,40 @@ twitch-videoad.js text/javascript
                 'playerType': playerType
             }
         };
-        return gqlRequest(body, realFetch);
+        return gqlRequest(body);
     }
-    function gqlRequest(body, realFetch) {
-        if (ClientIntegrityHeader == null) {
-            //console.warn('ClientIntegrityHeader is null');
-            //throw 'ClientIntegrityHeader is null';
-        }
-        var fetchFunc = realFetch ? realFetch : fetch;
-        return fetchFunc('https://gql.twitch.tv/gql', {
-            method: 'POST',
-            body: JSON.stringify(body),
-            headers: {
-                'Client-Id': CLIENT_ID,
-                'Client-Integrity': ClientIntegrityHeader,
-                'X-Device-Id': gql_device_id,
-                'Authorization': AuthorizationHeader
+    function gqlRequest(body) {
+        if (!gql_device_id) {
+            const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+            for (let i = 0; i < 32; i += 1) {
+                gql_device_id += chars.charAt(Math.floor(Math.random() * chars.length));
             }
+        }
+        var headers = {
+            'Client-Id': CLIENT_ID,
+            'Client-Integrity': ClientIntegrityHeader,
+            'X-Device-Id': gql_device_id,
+            'Authorization': AuthorizationHeader
+        };
+        return new Promise((resolve, reject) => {
+            const requestId = Math.random().toString(36).substring(2, 15);
+            const fetchRequest = {
+                id: requestId,
+                url: 'https://gql.twitch.tv/gql',
+                options: {
+                    method: 'POST',
+                    body: JSON.stringify(body),
+                    headers
+                }
+            };
+            pendingFetchRequests.set(requestId, {
+                resolve,
+                reject
+            });
+            postMessage({
+                key: 'FetchRequest',
+                value: fetchRequest
+            });
         });
     }
     function parseAttributes(str) {
@@ -453,9 +576,84 @@ twitch-videoad.js text/javascript
             worker.postMessage({key: key, value: value});
         });
     }
+    function makeGmXmlHttpRequest(fetchRequest) {
+        return new Promise((resolve, reject) => {
+            GM.xmlHttpRequest({
+                method: fetchRequest.options.method,
+                url: fetchRequest.url,
+                data: fetchRequest.options.body,
+                headers: fetchRequest.options.headers,
+                onload: response => resolve(response),
+                onerror: error => reject(error)
+            });
+        });
+    }
+    // Taken from https://github.com/dimdenGD/YeahTwitter/blob/9e0520f5abe029f57929795d8de0d2e5d3751cf3/us.js#L48
+    function parseHeaders(headersString) {
+        const headers = new Headers();
+        const lines = headersString.trim().split(/[\r\n]+/);
+        lines.forEach(line => {
+            const parts = line.split(':');
+            const header = parts.shift();
+            const value = parts.join(':');
+            headers.append(header, value);
+        });
+        return headers;
+    }
+    var serverLikesThisBrowser = false;
+    var serverHatesThisBrowser = false;
+    async function handleWorkerFetchRequest(fetchRequest) {
+        try {
+            if (serverLikesThisBrowser || !serverHatesThisBrowser) {
+                const response = await unsafeWindow.realFetch(fetchRequest.url, fetchRequest.options);
+                const responseBody = await response.text();
+                const responseObject = {
+                    id: fetchRequest.id,
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(response.headers.entries()),
+                    body: responseBody
+                };
+                if (responseObject.status === 200) {
+                    var resp = JSON.parse(responseBody);
+                    if (typeof resp.errors !== 'undefined') {
+                        serverHatesThisBrowser = true;
+                    } else {
+                        serverLikesThisBrowser = true;
+                    }
+                }
+                if (serverLikesThisBrowser || !serverHatesThisBrowser) {
+                    return responseObject;
+                }
+            }
+            if (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest !== 'undefined') {
+                fetchRequest.options.headers['Sec-Ch-Ua'] = '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"';
+                fetchRequest.options.headers['Referer'] = 'https://www.twitch.tv/';
+                fetchRequest.options.headers['Origin'] = 'https://www.twitch.tv/';
+                fetchRequest.options.headers['Host'] = 'gql.twitch.tv';
+                const response = await makeGmXmlHttpRequest(fetchRequest);
+                const responseBody = response.responseText;
+                const responseObject = {
+                    id: fetchRequest.id,
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: Object.fromEntries(parseHeaders(response.responseHeaders).entries()),
+                    body: responseBody
+                };
+                return responseObject;
+            }
+            throw { message: 'Failed to resolve GQL request. Try the userscript version of the ad blocking solution' };
+        } catch (error) {
+            return {
+                id: fetchRequest.id,
+                error: error.message
+            };
+        }
+    }
     function hookFetch() {
-        var realFetch = window.fetch;
-        window.fetch = function(url, init, ...args) {
+        var realFetch = unsafeWindow.fetch;
+        unsafeWindow.realFetch = realFetch;
+        unsafeWindow.fetch = function(url, init, ...args) {
             if (typeof url === 'string') {
                 if (url.includes('gql')) {
                     var deviceId = init.headers['X-Device-Id'];
@@ -591,6 +789,7 @@ twitch-videoad.js text/javascript
                 }
             });
         }catch{}
+        let hidden = document.__lookupGetter__('hidden');
         try {
             Object.defineProperty(document, 'hidden', {
                 get() {
@@ -603,9 +802,23 @@ twitch-videoad.js text/javascript
             e.stopPropagation();
             e.stopImmediatePropagation();
         };
-        document.addEventListener('visibilitychange', block, true);
-        document.addEventListener('webkitvisibilitychange', block, true);
-        document.addEventListener('mozvisibilitychange', block, true);
+        let wasVideoPlaying = true;
+        var visibilityChange = e => {
+            if (typeof chrome !== 'undefined') {
+                const videos = document.getElementsByTagName('video');
+                if (videos.length > 0) {
+                    if (hidden.apply(document) === true) {
+                        wasVideoPlaying = !videos[0].paused && !videos[0].ended;
+                    } else if (wasVideoPlaying && !videos[0].ended) {
+                        videos[0].play();
+                    }
+                }
+            }
+            block(e);
+        };
+        document.addEventListener('visibilitychange', visibilityChange, true);
+        document.addEventListener('webkitvisibilitychange', visibilityChange, true);
+        document.addEventListener('mozvisibilitychange', visibilityChange, true);
         document.addEventListener('hasFocus', block, true);
         try {
             if (/Firefox/.test(navigator.userAgent)) {
@@ -649,19 +862,15 @@ twitch-videoad.js text/javascript
             return realGetItem.apply(this, arguments);
         };
     }
-    if (window.Worker.toString().includes('twitch')) {
-        console.log('Twitch Worker is already hooked');
+    unsafeWindow.reloadTwitchPlayer = reloadTwitchPlayer;
+    declareOptions(unsafeWindow);
+    hookWindowWorker();
+    hookFetch();
+    if (document.readyState === "complete" || document.readyState === "loaded" || document.readyState === "interactive") {
+        onContentLoaded();
     } else {
-        window.reloadTwitchPlayer = reloadTwitchPlayer;
-        declareOptions(window);
-        hookWindowWorker();
-        hookFetch();
-        if (document.readyState === "complete" || document.readyState === "loaded" || document.readyState === "interactive") {
+        unsafeWindow.addEventListener("DOMContentLoaded", function() {
             onContentLoaded();
-        } else {
-            window.addEventListener("DOMContentLoaded", function() {
-                onContentLoaded();
-            });
-        }
+        });
     }
 })();
